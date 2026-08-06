@@ -8,13 +8,14 @@ import {
 /**
  * Counting model from aryanvij02/PushUpCounter:
  *   form lock → direction half-reps (+0.5 down, +0.5 up) → display floor(count)
- * Plus plank-stance gate so standing waves / getting up don't count.
+ * Strict stance only to ARM; while locked, only unlock if clearly standing.
  */
 const DOWN_ANGLE = 125
 const UP_ANGLE = 150
 const FORM_HOLD_FRAMES = 12
 const EXTREME_FRAMES = 5
-const MIN_FLIP_MS = 550 // min time between half-rep flips (kills chatter)
+const MIN_FLIP_MS = 550
+const STANDING_UNLOCK_FRAMES = 18 // must look standing this long to unlock mid-set
 const VIS_MIN = 0.15
 
 const L = { shoulder: 11, elbow: 13, wrist: 15 }
@@ -49,12 +50,15 @@ function elbowAvg(lm) {
   return { left, right, avg: (left + right) / 2 }
 }
 
+function shoulderSpan(lm) {
+  return Math.abs(lm[L.shoulder].x - lm[R.shoulder].x)
+}
+
 /**
- * Reject standing / waving / getting into position.
- * Pushup plank (front cam): wrists near floor level (at/below shoulders),
- * torso not upright.
+ * Strict checks — only used before lock (arming).
+ * Wrist/elbow height fails often during a real pushup ROM, so never use this to unlock.
  */
-function pushupStance(lm) {
+function armingStance(lm) {
   const ls = lm[L.shoulder]
   const rs = lm[R.shoulder]
   const le = lm[L.elbow]
@@ -62,7 +66,6 @@ function pushupStance(lm) {
   const lw = lm[L.wrist]
   const rw = lm[R.wrist]
 
-  // Y increases downward — waving arms overhead => wrist.y << shoulder.y
   if (lw.y < ls.y - 0.06 || rw.y < rs.y - 0.06) {
     return { ok: false, reason: 'Plank only — wrists down' }
   }
@@ -70,22 +73,28 @@ function pushupStance(lm) {
     return { ok: false, reason: 'Plank only — not waving' }
   }
 
-  const shoulderY = (ls.y + rs.y) / 2
-  const shoulderW = Math.abs(ls.x - rs.x)
+  const shoulderW = shoulderSpan(lm)
   if (shoulderW < 0.12) {
     return { ok: false, reason: 'Square up to camera' }
   }
 
-  // Standing: hips far below shoulders (tall vertical torso)
-  if (vis(lm, HIP_L) >= 0.25 && vis(lm, HIP_R) >= 0.25) {
-    const hipY = (lm[HIP_L].y + lm[HIP_R].y) / 2
-    const torsoH = hipY - shoulderY
-    if (torsoH > 0 && torsoH / shoulderW > 0.8) {
-      return { ok: false, reason: 'Get into plank (not standing)' }
-    }
+  if (isClearlyStanding(lm)) {
+    return { ok: false, reason: 'Get into plank (not standing)' }
   }
 
   return { ok: true, reason: '' }
+}
+
+/** Only clear upright standing — safe to unlock mid-set after sustained frames. */
+function isClearlyStanding(lm) {
+  if (vis(lm, HIP_L) < 0.35 || vis(lm, HIP_R) < 0.35) return false
+  const shoulderY = (lm[L.shoulder].y + lm[R.shoulder].y) / 2
+  const hipY = (lm[HIP_L].y + lm[HIP_R].y) / 2
+  const shoulderW = shoulderSpan(lm)
+  if (shoulderW < 0.1) return false
+  const torsoH = hipY - shoulderY
+  // Stricter than arming — must really be upright
+  return torsoH > 0 && torsoH / shoulderW > 1.05
 }
 
 async function openCamera(facingMode) {
@@ -116,6 +125,7 @@ export default function PushupCounter({ onCountChange }) {
   })
   const [facingMode, setFacingMode] = useState('user')
   const [switching, setSwitching] = useState(false)
+  const [formLocked, setFormLocked] = useState(false)
 
   // Repo state
   const formRef = useRef(0) // 0 until plank locked
@@ -124,6 +134,7 @@ export default function PushupCounter({ onCountChange }) {
   const formHoldRef = useRef(0)
   const atDownFramesRef = useRef(0)
   const atUpFramesRef = useRef(0)
+  const standingFramesRef = useRef(0)
   const smoothRef = useRef(null)
   const lastFlipAtRef = useRef(0)
 
@@ -146,6 +157,10 @@ export default function PushupCounter({ onCountChange }) {
     setStatus(next)
   }
 
+  function syncLockBadge(locked) {
+    setFormLocked((prev) => (prev === locked ? prev : locked))
+  }
+
   function emitCount() {
     const whole = Math.floor(halfCountRef.current)
     if (whole !== lastEmittedRef.current) {
@@ -161,9 +176,11 @@ export default function PushupCounter({ onCountChange }) {
     formHoldRef.current = 0
     atDownFramesRef.current = 0
     atUpFramesRef.current = 0
+    standingFramesRef.current = 0
     smoothRef.current = null
     lastFlipAtRef.current = 0
     lastEmittedRef.current = 0
+    syncLockBadge(false)
   }
 
   /** Leave plank → disarm counting, keep existing rep total. */
@@ -173,8 +190,10 @@ export default function PushupCounter({ onCountChange }) {
     formHoldRef.current = 0
     atDownFramesRef.current = 0
     atUpFramesRef.current = 0
+    standingFramesRef.current = 0
     // If we were halfway through a rep (dir=1), drop the dangling 0.5
     halfCountRef.current = Math.floor(halfCountRef.current)
+    syncLockBadge(false)
   }
 
   useEffect(() => {
@@ -267,15 +286,6 @@ export default function PushupCounter({ onCountChange }) {
             return
           }
 
-          const stance = pushupStance(landmarks)
-          if (!stance.ok) {
-            if (formRef.current === 1) disarmForm()
-            formHoldRef.current = 0
-            updateStatus(stance.reason)
-            ctx.restore()
-            return
-          }
-
           const elbows = elbowAvg(landmarks)
           if (!elbows) {
             ctx.restore()
@@ -300,14 +310,20 @@ export default function PushupCounter({ onCountChange }) {
           }
 
           const now = performance.now()
-          const bothDown =
-            elbows.left <= DOWN_ANGLE + 8 && elbows.right <= DOWN_ANGLE + 8
-          const bothUp =
-            elbows.left > UP_ANGLE - 5 && elbows.right > UP_ANGLE - 5
           const canFlip = now - lastFlipAtRef.current >= MIN_FLIP_MS
 
-          // --- Form lock: plank stance + straight arms ---
+          // --- Not locked: strict stance + hold plank to arm ---
           if (formRef.current === 0) {
+            const stance = armingStance(landmarks)
+            if (!stance.ok) {
+              formHoldRef.current = 0
+              updateStatus(stance.reason)
+              ctx.restore()
+              return
+            }
+
+            const bothUp =
+              elbows.left > UP_ANGLE - 5 && elbows.right > UP_ANGLE - 5
             if (elbow > UP_ANGLE && bothUp) {
               formHoldRef.current += 1
               updateStatus(
@@ -318,7 +334,9 @@ export default function PushupCounter({ onCountChange }) {
                 directionRef.current = 0
                 atDownFramesRef.current = 0
                 atUpFramesRef.current = 0
+                standingFramesRef.current = 0
                 lastFlipAtRef.current = now
+                syncLockBadge(true)
                 updateStatus('READY — go down')
               }
             } else {
@@ -329,10 +347,9 @@ export default function PushupCounter({ onCountChange }) {
             return
           }
 
-          // --- Half-rep direction machine ---
-          // dir 0 → need DOWN → +0.5, dir=1
-          // dir 1 → need UP   → +0.5, dir=0 (full rep)
-          if (elbow <= DOWN_ANGLE && bothDown) {
+          // --- Locked: count using smoothed avg (don't disarm on wrist flicker) ---
+          // dir 0 → DOWN → +0.5; dir 1 → UP → +0.5 (full rep)
+          if (elbow <= DOWN_ANGLE) {
             atDownFramesRef.current += 1
             atUpFramesRef.current = 0
             updateStatus('DOWN')
@@ -348,7 +365,7 @@ export default function PushupCounter({ onCountChange }) {
               lastFlipAtRef.current = now
               emitCount()
             }
-          } else if (elbow > UP_ANGLE && bothUp) {
+          } else if (elbow > UP_ANGLE) {
             atUpFramesRef.current += 1
             atDownFramesRef.current = 0
             updateStatus(directionRef.current === 1 ? 'UP — almost' : 'UP')
@@ -369,6 +386,17 @@ export default function PushupCounter({ onCountChange }) {
             atDownFramesRef.current = 0
             atUpFramesRef.current = 0
             updateStatus(directionRef.current === 1 ? 'Push up' : 'Go down')
+          }
+
+          // Unlock only after sustained upright standing — not mid pushup ROM
+          if (isClearlyStanding(landmarks)) {
+            standingFramesRef.current += 1
+            if (standingFramesRef.current >= STANDING_UNLOCK_FRAMES) {
+              disarmForm()
+              updateStatus('Unlocked — get back to plank')
+            }
+          } else {
+            standingFramesRef.current = 0
           }
 
           ctx.restore()
@@ -479,7 +507,15 @@ export default function PushupCounter({ onCountChange }) {
         {status}
       </p>
 
-      <div className="pointer-events-none absolute left-3 top-14 rounded-lg bg-black/70 px-3 py-2 font-mono text-xs text-white">
+      <div
+        className={`pointer-events-none absolute left-1/2 top-10 z-10 -translate-x-1/2 rounded-full px-5 py-2 text-sm font-bold uppercase tracking-wide text-white shadow-lg ${
+          formLocked ? 'bg-green-500' : 'bg-red-500'
+        }`}
+      >
+        {formLocked ? 'Pushup locked' : 'Not locked'}
+      </div>
+
+      <div className="pointer-events-none absolute left-3 top-24 rounded-lg bg-black/70 px-3 py-2 font-mono text-xs text-white">
         <div>avg {debug.avg}°</div>
         <div>
           L {debug.left}° · R {debug.right}°
