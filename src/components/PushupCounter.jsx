@@ -4,6 +4,7 @@ import {
   PoseLandmarker,
   DrawingUtils,
 } from '@mediapipe/tasks-vision'
+import { playRepBeep } from '../utils/beep.js'
 
 /**
  * Counting model from aryanvij02/PushUpCounter:
@@ -166,6 +167,7 @@ export default function PushupCounter({ onCountChange }) {
     if (whole !== lastEmittedRef.current) {
       lastEmittedRef.current = whole
       onCountChangeRef.current?.(whole)
+      if (whole > 0) playRepBeep()
     }
   }
 

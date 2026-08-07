@@ -1,5 +1,6 @@
 import { useState } from 'react'
 import PushupCounter from './components/PushupCounter.jsx'
+import { unlockBeep } from './utils/beep.js'
 
 function formatDuration(ms) {
   const totalSec = Math.max(0, Math.floor(ms / 1000))
@@ -15,6 +16,7 @@ export default function App() {
   const [elapsedMs, setElapsedMs] = useState(0)
 
   function handleStart() {
+    unlockBeep()
     setCount(0)
     setElapsedMs(0)
     setStartedAt(Date.now())
